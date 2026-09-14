@@ -10,6 +10,9 @@ on:
         type: boolean
         default: false
 
+permissions:
+  contents: write               # 저장소에 쓰려면 필요하다
+
 jobs:
   publish:
     runs-on: ubuntu-latest
@@ -31,6 +34,14 @@ jobs:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           DRY_RUN: "0"
           TZ: Asia/Seoul
+
+      - name: 기록 커밋
+        if: ${{ !inputs.dry_run }}
+        run: |
+          git config user.name  "newsroom-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add store/
+          git diff --cached --quiet || (git commit -m "metrics: $(date +%F)" && git push)
 
       - name: 실행 기록 보관    # ⑤ 로그 말고 파일로 남은 것도 챙긴다
         if: always()

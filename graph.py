@@ -1,4 +1,4 @@
-import operator, feedparser, requests, re, os, json, trafilatura
+import operator, feedparser, requests, re, os, json, pathlib, trafilatura
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, TypedDict
 from langgraph.graph import StateGraph, START, END
@@ -229,15 +229,20 @@ def build():
 INIT = {"hours": 24,
         "collected": [], "picked": [], "drafted": [], "verified": [], "log": []}
 
-def record(state):
-    os.makedirs("store", exist_ok=True)
-    now = datetime.now().strftime("%Y-%m-%d %H:%M")
-    with open("store/runs.log", "a", encoding="utf-8") as f:
-        f.write(f"{now} · 수집 {len(state['collected'])} · 선별 {len(state['picked'])} · "
-                f"취재 {len(state['drafted'])} · 검수 {len(state['verified'])} · "
-                f"발행 {len(state['verified'])}\n")
-
-def run():
-    state = build().compile().invoke(INIT)
-    record(state)
-    return state
+def run():                                     # 돌리고, 한 줄 남긴다
+    out = build().compile().invoke(INIT)
+    row = {"run_id":    datetime.now().strftime("%Y-%m-%d %H:%M"),
+           "collected": len(out["collected"]),
+           "picked":    len(out["picked"]),
+           "drafted":   len(out["drafted"]),
+           "published": len(out["verified"]),
+           "hours":     out["hours"],
+           "by_source": {},
+           "log":       out["log"]}
+    for a in out["verified"]:
+        row["by_source"][a["source"]] = row["by_source"].get(a["source"], 0) + 1
+    path = pathlib.Path("store/metrics.jsonl")
+    path.parent.mkdir(exist_ok=True)
+    with path.open("a") as f:
+        f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    return out
