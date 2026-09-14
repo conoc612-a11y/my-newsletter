@@ -1,0 +1,243 @@
+import operator, feedparser, requests, re, os, json, trafilatura
+from datetime import datetime, timedelta, timezone
+from typing import Annotated, TypedDict
+from langgraph.graph import StateGraph, START, END
+from langgraph.types import Send
+from openai import OpenAI
+from pydantic import BaseModel, Field
+
+try:
+    env = dict(l.strip().split("=", 1) for l in open("keys.env", encoding="utf-8")
+               if "=" in l and not l.strip().startswith("#"))
+except FileNotFoundError:
+    env = {}                                     # CI에선 워크플로 env로 들어온다
+for k in ("OPENAI_API_KEY", "DISCORD_WEBHOOK_URL"):
+    if k in env:
+        os.environ[k] = env[k]
+client = OpenAI()
+
+UA = {"User-Agent": "Mozilla/5.0 (newsletter-agent-course)"}
+SOURCES = [
+    ("OpenAI",     "https://openai.com/blog/rss.xml"),
+    ("DeepMind",   "https://deepmind.google/blog/rss.xml"),
+    ("TechCrunch", "https://techcrunch.com/category/artificial-intelligence/feed/"),
+    ("The Verge",  "https://www.theverge.com/rss/ai-artificial-intelligence/index.xml"),
+    ("AI타임스",    "https://www.aitimes.com/rss/allArticle.xml"),
+]
+
+def strip_tags(s):
+    return re.sub(r"<[^>]+>", "", s or "").strip()
+
+def published_at(entry):
+    t = entry.get("published_parsed")
+    return datetime(*t[:6], tzinfo=timezone.utc) if t else None
+
+class Brief(TypedDict):
+    hours:     int                              # 수집 시간 창(시간)
+    collected: list                             # ① 수집한 기사
+    picked:    list                             # ② 선별해 남긴 다섯 건
+    drafted:   Annotated[list, operator.add]    # ③ 취재한 초안 — 워커들이 나눠 채운다
+    verified:  list                             # ← 검수를 통과한 것
+    log:       Annotated[list, operator.add]    # 무슨 일이 있었는지
+
+def collect(s: dict) -> dict:                  # ① 자료 수집
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=s["hours"])
+    items, dead, seen = [], [], set()
+    for name, url in SOURCES:
+        try:
+            feed = feedparser.parse(requests.get(url, headers=UA, timeout=20).content)
+        except Exception:
+            dead.append(name)                   # 한 곳이 죽어도 나머지는 계속
+            continue
+        for e in feed.entries:
+            at = published_at(e)
+            if not at or at < cutoff:           # 시간 창 밖이거나 날짜가 없으면 버린다
+                continue
+            key = e.link.split("?")[0].rstrip("/")       # 추적용 꼬리표를 떼고 비교
+            if key in seen:
+                continue
+            seen.add(key)
+            items.append({"title": e.title, "url": e.link, "source": name, "at": at,
+                          "summary": strip_tags(e.get("summary", ""))[:300]})
+    return {"collected": items,
+            "log": [f"① 수집   {s['hours']}시간 창 · {len(items)}건"
+                    + (f" · 응답 없음 {dead}" if dead else "")]}
+
+class Pick(BaseModel):
+    index: int = Field(description="후보 목록에서의 번호")
+    reason: str = Field(description="왜 골랐는지 한 문장")
+    event: str = Field(description="이 기사가 다루는 사건을 짧은 라벨로. 같은 사건이면 같은 라벨")
+
+class Shortlist(BaseModel):
+    picks: list[Pick]
+
+BATCH, TARGET = 40, 5          # 예선 묶음 크기, 최종 발행 건수
+
+CRITERIA = ("독자는 AI를 실제 제품에 붙이는 국내 개발팀입니다.\n"
+            "- 이번 주 일하는 방식이 바뀔 만한가\n"
+            "- 지금 쓰는 도구·API의 가격·한도·정책이 실제로 변했나\n"
+            "버릴 것: 발표 예정·로드맵만 있는 것, MOU·투자유치·수상 같은 홍보성 소식")
+
+def ask_picks(items, n):
+    listing = "\n".join(f"{i}. [{it['source']}] {it['title']}" for i, it in enumerate(items))
+    sys = (f"{CRITERIA}\n\n아래 목록에서 중요한 순서대로 {n}건을 고르세요.\n"
+           "같은 사건을 다룬 기사에는 같은 event 라벨을 붙이세요.")
+    out = client.chat.completions.parse(
+        model="gpt-4.1-mini", temperature=0,
+        messages=[{"role": "system", "content": sys},
+                  {"role": "user", "content": listing}],
+        response_format=Shortlist).choices[0].message.parsed
+    return [p for p in out.picks if 0 <= p.index < len(items)]      # 없는 번호는 버린다
+
+def select(s: dict) -> dict:                   # ② 중요도 선별
+    items = s["collected"]
+    survivors = []
+    for i in range(0, len(items), BATCH):       # 예선 — 묶음마다 여덟 건
+        chunk = items[i:i + BATCH]
+        survivors += [chunk[p.index] for p in ask_picks(chunk, 8)]
+    finals = ask_picks(survivors, TARGET)       # 본선 — 한 화면에 놓고 다섯 건
+    return {"picked": [survivors[p.index] for p in finals],
+            "log": [f"② 선별   {len(items)} → 예선 {len(survivors)} → {len(finals)}건"]}
+
+class Draft(BaseModel):
+    headline: str = Field(description="20자 내외의 한국어 헤드라인")
+    summary:  str = Field(description="세 문장 요약. ~합니다체, 과장 없이 건조하게")
+    why:      str = Field(description="국내 개발팀에게 왜 중요한지 한 문장")
+
+SYS = ("당신은 국내 개발팀을 위한 AI 뉴스레터 기자입니다.\n"
+       "아래 기사 본문을 읽고 헤드라인·요약·왜 중요한지를 쓰세요.\n"
+       "'주목된다·기대를 모은다' 같은 기자체 표현은 쓰지 마세요.\n"
+       "원문이 어떤 언어든 헤드라인·요약·why는 반드시 무조건 한국어로만 답하세요.")
+
+class ReportIn(TypedDict):                     # 워커가 받는 것은 기사 하나뿐
+    item: dict
+
+def extract_body(url):
+    d = trafilatura.fetch_url(url)
+    return trafilatura.extract(d) if d else None
+
+def draft(body):
+    return client.chat.completions.parse(
+        model="gpt-4.1-mini", temperature=0,
+        messages=[{"role": "system", "content": SYS},
+                  {"role": "user", "content": body[:6000]}],
+        response_format=Draft).choices[0].message.parsed
+
+def fan_report(s: dict):                      # 기사 수만큼 워커를 펼친다
+    return [Send("report", {"item": it}) for it in s["picked"]]
+
+def report(s: ReportIn) -> dict:               # ③ 요약 — 기사 한 건을 맡는다
+    it = s["item"]
+    body = extract_body(it["url"])
+    if not body or len(body) < 600:            # G1 기준선
+        return {"drafted": [],
+                "log": [f"   취재 제외 {it['source']} · 본문 {len(body or '')}자"]}
+    d = draft(body)
+    return {"drafted": [{**it, "body": body[:6000], **d.model_dump()}]}
+
+class Verdict(BaseModel):
+    ok:       bool      = Field(description="요약이 원문에 근거하면 true")
+    problems: list[str] = Field(description="근거 없는 부분. 없으면 빈 목록")
+
+SYS_CHECK = ("요약이 원문에서 뒷받침되는지 판정하세요.\n"
+             "헤드라인과 요약만 보고 판단하고, 번역이나 단위 환산은 문제가 아닙니다.")
+
+def check(d):
+    user = (f"[원문]\n{d['body'][:5000]}\n\n"
+            f"[헤드라인]\n{d['headline']}\n\n[요약]\n{d['summary']}")
+    return client.chat.completions.parse(
+        model="gpt-4.1-mini", temperature=0,
+        messages=[{"role": "system", "content": SYS_CHECK},
+                  {"role": "user", "content": user}],
+        response_format=Verdict).choices[0].message.parsed
+
+def verify(s: dict) -> dict:                  # ④ 검수
+    kept, dropped = [], []
+    for d in s["drafted"]:
+        (kept if check(d).ok else dropped).append(d)
+    return {"verified": kept,
+            "log": [f"④ 검수   {len(s['drafted'])} → {len(kept)}건"
+                    + (f" · 불합격 {[x['source'] for x in dropped]}" if dropped else "")]}
+
+COLORS = {"모델·API": 0x0B6E77, "도구·프레임워크": 0x4C7C9C,
+          "정책·규제": 0x8F5606, "사례·적용": 0x2E7D5B, "연구": 0x6A4A9C}
+DEFAULT = 0x5F7476
+TITLE_MAX, DESC_MAX, EMBED_MAX, TOTAL_MAX = 256, 4096, 10, 5800   # 6000에서 여유를 둔다
+
+def build_embeds(run_id, lead, articles):
+    if not articles:                                   # 조용한 날에도 한 장은 보낸다
+        return [{"title": f"🗞️ {run_id}", "color": DEFAULT,
+                 "description": "오늘은 조용합니다."}]
+    embeds = [{"title": f"🗞️ {run_id} · AI 브리핑", "description": lead, "color": DEFAULT}]
+    for i, a in enumerate(articles, 1):
+        desc = a["summary"]
+        if a.get("why"):
+            desc += f"\n\n💡 **{a['why']}**"
+        embeds.append({
+            "title":       f"{i}. {a['headline']}"[:TITLE_MAX],
+            "description": desc[:DESC_MAX],
+            "url":         a["url"],
+            "color":       COLORS.get(a.get("topic", ""), DEFAULT),
+            "footer":      {"text": f"{a['source']} · {a['when']}"},
+        })
+    total = lambda es: sum(len(e.get("title", "")) + len(e.get("description", ""))
+                           + len(e.get("footer", {}).get("text", "")) for e in es)
+    while len(embeds) > EMBED_MAX or total(embeds) > TOTAL_MAX:
+        embeds.pop()                                   # 뒤에서부터 덜어낸다
+    return embeds
+
+def send(run_id, lead, articles, webhook=None, dry_run=True):
+    payload = {"username": "편집실", "embeds": build_embeds(run_id, lead, articles)}
+    if dry_run or not webhook:
+        print(f"[dry-run] embed {len(payload['embeds'])}개 · "
+              f"{len(json.dumps(payload, ensure_ascii=False))}자 — 보내지 않음")
+        return False
+    r = requests.post(webhook, json=payload, timeout=20)
+    ok = r.status_code in (200, 204)
+    print("발행:", "성공" if ok else f"실패 {r.status_code} {r.text[:120]}")
+    return ok
+
+def make_lead(arts):
+    if not arts:
+        return ""
+    srcs = ", ".join(dict.fromkeys(a["source"] for a in arts))
+    return f"오늘은 {len(arts)}건을 골랐습니다. ({srcs})"
+
+def publish(s: dict) -> dict:                 # ⑤ 발행
+    arts = [{"headline": a["headline"], "summary": a["summary"], "why": a["why"],
+             "url": a["url"], "source": a["source"], "topic": a.get("event", ""),
+             "when": a["at"].strftime("%m-%d %H:%M")} for a in s["verified"]]
+    today = datetime.now().strftime("%Y-%m-%d")
+    sent  = send(today, make_lead(arts), arts,
+                 webhook=os.environ.get("DISCORD_WEBHOOK_URL"),
+                 dry_run=os.environ.get("DRY_RUN", "1") == "1")   # 기본은 보내지 않음
+    label = f"{len(arts)}건" if arts else "조용합니다"
+    return {"log": [f"⑤ 발행   {label} · {'보냄' if sent else 'dry-run'}"]}
+
+def build():
+    g = StateGraph(Brief)
+    for name in ("collect", "select", "report", "verify", "publish"):
+        g.add_node(name, globals()[name])
+    g.add_edge(START, "collect")
+    g.add_edge("collect", "select")
+    g.add_conditional_edges("select", fan_report, ["report"])
+    g.add_edge("report", "verify")
+    g.add_edge("verify", "publish")
+    g.add_edge("publish", END)
+    return g
+
+INIT = {"hours": 24,
+        "collected": [], "picked": [], "drafted": [], "verified": [], "log": []}
+
+def record(state):
+    os.makedirs("store", exist_ok=True)
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    with open("store/runs.log", "a", encoding="utf-8") as f:
+        f.write(f"{now} · 수집 {len(state['collected'])} · 선별 {len(state['picked'])} · "
+                f"취재 {len(state['drafted'])} · 검수 {len(state['verified'])} · "
+                f"발행 {len(state['verified'])}\n")
+
+def run():
+    state = build().compile().invoke(INIT)
+    record(state)
+    return state
