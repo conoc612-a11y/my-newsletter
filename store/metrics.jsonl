@@ -1,1 +1,2 @@
 {"run_id": "2026-09-14 15:06", "collected": 5, "picked": 5, "drafted": 5, "published": 5, "hours": 24, "by_source": {"OpenAI": 1, "AI타임스": 1, "TechCrunch": 2, "The Verge": 1}, "log": ["① 수집   24시간 창 · 5건", "② 선별   5 → 예선 5 → 5건", "④ 검수   5 → 5건", "⑤ 발행   5건 · dry-run"]}
+{"run_id": "2026-09-15 09:48", "collected": 16, "picked": 5, "drafted": 5, "published": 5, "hours": 24, "by_source": {"TechCrunch": 2, "The Verge": 3}, "log": ["① 수집   24시간 창 · 16건", "② 선별   16 → 예선 8 → 5건", "④ 검수   5 → 5건", "⑤ 발행   5건 · 보냄"]}
